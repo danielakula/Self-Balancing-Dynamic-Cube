@@ -1,0 +1,317 @@
+#include <Arduino.h>
+#include <SimpleFOC.h>
+#include <SPI.h>
+#include "esp_task_wdt.h"
+
+TaskHandle_t MotorTaskHandle;
+
+SemaphoreHandle_t spiMutex = xSemaphoreCreateMutex();
+
+#define SLAVE_SCK   4
+#define SLAVE_MISO  6
+#define SLAVE_MOSI  5
+// ================================================================
+//  DRIVER 3 DEFINITIONS
+// ================================================================
+#define ENC2_CS     39
+#define DRV2_CS     35 
+#define DRV2_EN     46
+#define nFAULT2     45
+
+#define AH2_PIN  48
+#define AL2_PIN  47
+#define BH2_PIN  21
+#define BL2_PIN  14
+#define CH2_PIN  13
+#define CL2_PIN  12
+
+#define SOA2_PIN  1
+#define SOB2_PIN  2
+
+// ================================================================
+//  CURRENT SENSE PARAMETERS
+//  R_shunt  = 10 mOhm = 0.010 Ohm
+//  CSA gain = 20 V/V  (Reg 0x06 bits 7:6 = 10b -> 20V/V)
+// ================================================================
+#define R_SHUNT     0.010f   // 10 mOhm
+#define CSA_GAIN    20.0f    // 20 V/V
+#define I_LIMIT     1.0f     // Amps
+
+// ================================================================
+//  SPI — single bus, manual CS
+// ================================================================
+SPIClass hwSpi(1);
+
+// ================================================================
+//  DRV8323S
+// ================================================================
+void drvWriteSpi(uint8_t address, uint16_t data) {
+    // Take the mutex - wait up to 100ms if someone else has it
+    if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        digitalWrite(ENC2_CS, HIGH);
+        uint16_t frame = ((uint16_t)(address & 0x0F) << 11) | (data & 0x7FF);
+        hwSpi.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE1));
+        digitalWrite(DRV2_CS, LOW);
+        delayMicroseconds(1);
+        hwSpi.transfer16(frame);
+        delayMicroseconds(1);
+        digitalWrite(DRV2_CS, HIGH);
+        hwSpi.endTransaction();
+        
+        xSemaphoreGive(spiMutex); // Release the bus
+    }
+}
+
+uint16_t drvReadSpi(uint8_t address) {
+    uint16_t result = 0;
+    if (xSemaphoreTake(spiMutex, portMAX_DELAY) == pdTRUE) {
+        digitalWrite(ENC2_CS, HIGH);
+        uint16_t frame = (1 << 15) | ((uint16_t)(address & 0x0F) << 11);
+        hwSpi.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE1));
+        digitalWrite(DRV2_CS, LOW);
+        delayMicroseconds(1);
+        result = hwSpi.transfer16(frame);
+        delayMicroseconds(1);
+        digitalWrite(DRV2_CS, HIGH);
+        hwSpi.endTransaction();
+        xSemaphoreGive(spiMutex);
+    }
+    return result & 0x7FF;
+}
+
+void initDRV8323S() {
+    Serial.println("[DRV] Configuring...");
+    digitalWrite(DRV2_EN, LOW);  delay(50);
+    digitalWrite(DRV2_EN, HIGH); delay(100);
+
+    drvWriteSpi(0x02, 0b00000000000);
+    drvWriteSpi(0x03, 0b01100100010);
+    drvWriteSpi(0x04, 0b10100100010);
+    drvWriteSpi(0x05, 0b01000011001);
+    drvWriteSpi(0x06, 0b01110000011);
+
+    Serial.printf("[DRV] Reg02: 0x%03X\n", drvReadSpi(0x02));
+    Serial.printf("[DRV] Reg03: 0x%03X\n", drvReadSpi(0x03));
+    Serial.printf("[DRV] Reg04: 0x%03X\n", drvReadSpi(0x04));
+    Serial.printf("[DRV] Reg05: 0x%03X\n", drvReadSpi(0x05));
+    Serial.printf("[DRV] Reg06: 0x%03X\n", drvReadSpi(0x06));
+    Serial.printf("[DRV] Fault1: 0x%03X  Fault2: 0x%03X\n",
+                  drvReadSpi(0x00), drvReadSpi(0x01));
+}
+
+// ================================================================
+//  SIMPLEFOC OBJECTS
+// ================================================================
+BLDCDriver6PWM driver = BLDCDriver6PWM(AH2_PIN, AL2_PIN, BH2_PIN, BL2_PIN, CH2_PIN, CL2_PIN);
+BLDCMotor      motor  = BLDCMotor(14, 0.5f, 195.0f, 0.00018f);
+MagneticSensorSPI sensor = MagneticSensorSPI(AS5047_SPI, ENC2_CS);
+LowsideCurrentSense currentSense = LowsideCurrentSense(R_SHUNT, CSA_GAIN, SOA2_PIN, SOB2_PIN, _NC);
+
+Commander command = Commander(Serial);
+float target = 0.0f;  // Target current in Amps
+
+void onTarget(char* cmd) { command.scalar(&target, cmd); }
+
+// ================================================================
+//  THE REAL-TIME MOTOR TASK
+// ================================================================
+void motorRuntime(void * pvParameters) {
+    disableCore0WDT(); 
+    
+    TaskHandle_t idleTaskHandle = xTaskGetIdleTaskHandleForCPU(0);
+    if (idleTaskHandle != NULL) {
+        esp_task_wdt_delete(idleTaskHandle);
+    }
+
+    vTaskPrioritySet(NULL, configMAX_PRIORITIES - 1);
+
+    for(;;) {
+        if (xSemaphoreTake(spiMutex, portMAX_DELAY) == pdTRUE) {
+            motor.loopFOC();
+            motor.move(target);
+            xSemaphoreGive(spiMutex);
+        }
+    }
+}
+
+// ================================================================
+//  SETUP
+// ================================================================
+void setup() {
+    Serial.begin(115200);
+    delay(2000);
+    Serial.println("=== GL40 TORQUE CONTROL — LOW SIDE CURRENT SENSE ===");
+
+    pinMode(40, OUTPUT); // Status LED
+    digitalWrite(40, HIGH); 
+    delay(500);            
+    digitalWrite(40, LOW); 
+    delay(500);            
+    digitalWrite(40, HIGH); 
+
+    // Pins
+    pinMode(DRV2_CS,  OUTPUT); digitalWrite(DRV2_CS,  HIGH);
+    pinMode(ENC2_CS, OUTPUT); digitalWrite(ENC2_CS, HIGH);
+    pinMode(DRV2_EN,  OUTPUT); digitalWrite(DRV2_EN,  HIGH);
+    pinMode(nFAULT2,  INPUT_PULLUP);
+
+    // SPI
+    hwSpi.begin(SLAVE_SCK, SLAVE_MISO, SLAVE_MOSI, -1);
+
+    // DRV
+    initDRV8323S();
+
+    // Encoder
+    sensor.init(&hwSpi);
+    Serial.println("[ENC] OK");
+
+    // Driver
+    driver.pwm_frequency        = 20000;
+    driver.voltage_power_supply = 15.0f;
+    driver.voltage_limit        = 14.0f;
+    driver.dead_zone            = 0.001f;
+    if (!driver.init()) {
+        Serial.println("[DRV] Driver init FAILED — halting.");
+        while(1);
+    }
+    digitalWrite(DRV2_EN, HIGH);
+
+    // Current sense
+    // Link driver so SimpleFOC knows PWM timing for synchronised sampling
+    currentSense.linkDriver(&driver);
+
+    // Set ADC attenuation for 0-3100mV range on all three sense pins
+    // ADC_11db gives 0-2450mV on ESP32-S3 by default but with calibration
+    // reaches ~3100mV — SimpleFOC handles this via analogRead internally
+    analogReadResolution(12);
+    analogRead(SOA2_PIN);  // Initialises pin before setting attenuation
+    analogRead(SOB2_PIN);
+    analogSetPinAttenuation(SOA2_PIN, ADC_11db);
+    analogSetPinAttenuation(SOB2_PIN, ADC_11db);
+
+    // Init current sense — auto-calibrates Vref with motor stationary
+    // Samples ADC at zero current to find midpoint automatically
+    if (!currentSense.init()) {
+        Serial.println("[CS] Current sense init FAILED — halting.");
+        while(1);
+    }
+    Serial.println("[CS] Current sense calibrated OK.");
+
+    // Print Vref found by calibration
+    Serial.printf("[CS] Vref phase A: %.4f\n", currentSense.offset_ia);
+    Serial.printf("[CS] Vref phase B: %.4f\n", currentSense.offset_ib);
+    Serial.printf("[CS] Vref phase C: %.4f\n", currentSense.offset_ic);
+
+    // Motor
+    motor.linkSensor(&sensor);
+    motor.linkDriver(&driver);
+    motor.linkCurrentSense(&currentSense);
+
+    // FOC current torque control
+    motor.torque_controller = TorqueControlType::foc_current;
+    motor.controller        = MotionControlType::torque;
+
+    // Current PID — Q axis (torque producing)
+    // Bandwidth should be ~10x lower than PWM frequency
+    // At 25kHz PWM, target ~2.5kHz current loop bandwidth
+    motor.PID_current_q.P           = 0.3f;
+    motor.PID_current_q.I           = 50.0f;
+    motor.PID_current_q.D           = 0.0f;
+    motor.PID_current_q.limit       = 15.0f;
+    motor.PID_current_q.output_ramp = 1000.0f;
+    motor.PID_current_d.P           = 0.3f;
+    motor.PID_current_d.I           = 50.0f;
+    motor.PID_current_d.D           = 0.0f;
+    motor.PID_current_d.limit       = 15.0f;
+    motor.PID_current_d.output_ramp = 1000.0f;
+
+    motor.LPF_current_q.Tf          = 0.01f;
+    motor.LPF_current_d.Tf          = 0.01f;
+
+    motor.voltage_sensor_align = 1.0f;
+    motor.voltage_limit        = 14.0f;
+    motor.current_limit        = I_LIMIT;
+    motor.velocity_limit       = 10.0f;
+
+    motor.useMonitoring(Serial);
+    motor.init();
+
+    // initFOC — also aligns current sense phase directions automatically
+    Serial.println("[FOC] Running initFOC...");
+    if (!motor.initFOC()) {
+        Serial.println("[FOC] initFOC FAILED — halting.");
+        while(1);
+    }
+    Serial.printf("[FOC] Zero angle: %.4f  Direction: %s\n",
+                  motor.zero_electric_angle,
+                  motor.sensor_direction == Direction::CW ? "CW" : "CCW");
+    Serial.println("[FOC] OK.");
+
+    xTaskCreatePinnedToCore(
+        motorRuntime,
+        "MotorTask",
+        10000,
+        NULL,
+        5,                  // Priority 5
+        &MotorTaskHandle,
+        0);                 // Core 0
+
+    // Commander
+    // T command sets target current in Amps
+    // e.g. T2.0 -> 2A torque
+    //      T0   -> stop
+    //      T-2  -> reverse torque
+    command.add('T', onTarget, "target current (A)");
+    command.add('M', [](char* cmd){ command.motor(&motor, cmd); }, "motor");
+
+    Serial.println("=== READY ===");
+    Serial.println("Commands:");
+    Serial.printf("  T%.1f  -> max torque (7A)\n", I_LIMIT);
+    Serial.println("  T2.0  -> 2A torque");
+    Serial.println("  T0    -> stop");
+    Serial.println("  T-2   -> reverse torque");
+
+    command.add('P', [](char* cmd){ command.scalar(&motor.PID_current_q.P, cmd); }, "P gain");
+    command.add('I', [](char* cmd){ command.scalar(&motor.PID_current_q.I, cmd); }, "I gain");
+    command.add('F', [](char* cmd){ command.scalar(&motor.LPF_current_q.Tf, cmd); }, "LPF Tf");
+
+    // Sync D-axis to Q-axis (Optional but recommended for current sensing)
+    // This makes sure both axes stay identical while you tune.
+    command.add('S', [](char* cmd){ 
+    motor.PID_current_d.P = motor.PID_current_q.P;
+    motor.PID_current_d.I = motor.PID_current_q.I;
+    motor.LPF_current_d.Tf = motor.LPF_current_q.Tf;
+    Serial.println("D-axis synced to Q-axis");
+}, "sync D-axis");
+}
+
+// ================================================================
+//  LOOP
+// ================================================================
+void loop() {
+    command.run();
+    bool ledState = LOW;
+
+    static uint32_t last = 0;
+    if (millis() - last > 500) {
+
+        ledState = !ledState;
+        digitalWrite(40, ledState);
+        
+        DQCurrent_s foc = currentSense.getFOCCurrents(motor.electrical_angle);
+        float totalCurrent = hypot(foc.q, foc.d);
+
+
+        Serial.printf("Batt: %.2fV | Iq: %.2fA | Id: %.2fA | Target: %.2fA | Vel: %.1f\n",
+             foc.q, foc.d, target, motor.shaft_velocity);
+
+        if (digitalRead(nFAULT2) == LOW) {
+
+            uint16_t f1 = drvReadSpi(0x00);
+            uint16_t f2 = drvReadSpi(0x01);
+            Serial.printf(">>> [DRV FAULT] 0x%03X : 0x%03X <<<\n", f1, f2);
+        }
+
+        last = millis();
+    }
+}

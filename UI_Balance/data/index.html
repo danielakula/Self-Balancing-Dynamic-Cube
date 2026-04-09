@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Cubli Ground Control</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script>
+    
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #1e1e1e; color: #eee; margin: 0; padding: 15px; }
+        .grid-layout { display: grid; grid-template-columns: 1fr 1.2fr; gap: 15px; max-width: 1200px; margin: auto; }
+        .panel { background: #2d2d30; padding: 15px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); height: fit-content; }
+        h2 { margin-top: 0; color: #00ff88; font-size: 1.1rem; border-bottom: 1px solid #444; padding-bottom: 5px; margin-bottom: 12px;}
+        
+        .btn-group { display: flex; align-items: center; margin-bottom: 8px; }
+        .btn-group span { width: 70px; font-weight: bold; font-size: 0.9rem;}
+        button { background: #00ff88; color: #000; border: none; padding: 6px 12px; margin-right: 5px; cursor: pointer; border-radius: 4px; font-weight: bold; transition: 0.2s;}
+        button:hover { background: #00cc6a; }
+        .disabled { background: #444; color: #777; cursor: not-allowed; text-decoration: line-through; }
+        .btn-danger { background: #ff4444; color: white; width: 100%; max-width: 160px; }
+        
+        .tune-row { display: flex; align-items: center; margin-bottom: 6px; font-size: 0.9rem;}
+        .tune-row label { width: 40px; font-weight: bold; color: #00ff88;}
+        .tune-row input { width: 80px; padding: 4px; background: #1e1e1e; color: #fff; border: 1px solid #555; margin-right: 5px; text-align: center; border-radius: 4px;}
+        .active-val { margin-left: auto; color: #aaa; font-family: monospace; background: #222; padding: 2px 6px; border-radius: 3px;}
+        
+        #status { text-align: center; padding: 8px; background: #2d2d30; font-weight: bold; border-radius: 8px; max-width: 1200px; margin: auto; margin-bottom: 15px;}
+        .online { color: #00ff88; }
+        .offline { color: #ff4444; }
+        
+        #canvas-container { width: 100%; aspect-ratio: 1 / 1; max-height: 400px; margin: auto; background: #111; border-radius: 6px; overflow: hidden; }
+        .chart-container { position: relative; height: 180px; width: 100%; }
+        
+        .telemetry-row { grid-column: 1 / -1; display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 15px; }
+        .tel-box { background: #222; padding: 10px; border-radius: 4px; font-family: monospace; font-size: 0.85rem; border-left: 4px solid; line-height: 1.4; }
+    </style>
+</head>
+<body>
+
+    <div id="status" class="offline">Connecting...</div>
+
+    <div class="grid-layout">
+        <div style="display: flex; flex-direction: column; gap: 15px;">
+            <div class="panel">
+                <h2>System Controls</h2>
+                <div class="btn-group"><span>Edge 1</span><button onclick="sendCmd('state', 1, 1)">Balance</button><button class="disabled" disabled>Jump</button></div>
+                <div class="btn-group"><span>Edge 2</span><button class="disabled" disabled>Balance</button><button class="disabled" disabled>Jump</button></div>
+                <div class="btn-group"><span>Edge 3</span><button class="disabled" disabled>Balance</button><button class="disabled" disabled>Jump</button></div>
+                <div class="btn-group"><span>Corner</span><button class="disabled" disabled>Balance</button><button class="disabled" disabled>Jump</button></div>
+                <div style="margin-top: 15px;"><button onclick="sendCmd('state', 0, 0)" class="btn-danger">Disable</button></div>
+            </div>
+
+            <div class="panel">
+                <h2 style="display: flex; justify-content: space-between;"><span>Tuning</span><span style="font-size: 0.8rem; color: #aaa;">Active</span></h2>
+                <div id="tuning-ui"></div>
+            </div>
+        </div>
+
+        <div class="panel">
+            <h2>Orientation Visualizer</h2>
+            <div id="canvas-container"></div>
+        </div>
+
+        <div class="telemetry-row">
+            <div class="panel tel-box" style="border-left-color: #ff4444;" id="tel-m1">
+                <span style="color:#ff4444; font-weight:bold;">MOTOR 1 (PITCH)</span><br>Pitch: 0.0&deg; | Rate: 0.0&deg;/s<br>Vel: 0.0 rad/s | Trq: 0.00 A
+            </div>
+            <div class="panel tel-box" style="border-left-color: #4444ff;" id="tel-m2">
+                <span style="color:#4444ff; font-weight:bold;">MOTOR 2 (YAW)</span><br>Yaw: 0.0&deg; | Rate: 0.0&deg;/s<br>Vel: 0.0 rad/s | Trq: 0.00 A
+            </div>
+            <div class="panel tel-box" style="border-left-color: #44ff44;" id="tel-m3">
+                <span style="color:#44ff44; font-weight:bold;">MOTOR 3 (ROLL)</span><br>Roll: 0.0&deg; | Rate: 0.0&deg;/s<br>Vel: 0.0 rad/s | Trq: 0.00 A
+            </div>
+        </div>
+        
+        <div class="panel" style="grid-column: 1 / -1;">
+            <h2>Kinematics</h2>
+            <div class="grid-layout" style="gap: 10px;">
+                <div class="chart-container"><canvas id="chartAngles"></canvas></div>
+                <div class="chart-container"><canvas id="chartRates"></canvas></div>
+            </div>
+        </div>
+
+        <div class="panel" style="grid-column: 1 / -1;">
+            <h2>Motor Dynamics</h2>
+            <div class="grid-layout" style="gap: 10px;">
+                <div class="chart-container"><canvas id="chartVel"></canvas></div>
+                <div class="chart-container"><canvas id="chartCur"></canvas></div>
+            </div>
+        </div>
+    </div>
+
+<script>
+    const tuningParams = [{id:'kp',label:'Kp'},{id:'ki',label:'Ki'},{id:'k1',label:'k1'},{id:'k2',label:'k2'},{id:'k3',label:'k3'}];
+    const ui = document.getElementById('tuning-ui');
+    tuningParams.forEach(p => {
+        ui.innerHTML += `<div class="tune-row"><label>${p.label}:</label><input type="number" id="val_${p.id}" placeholder="New" step="0.001"><button onclick="sendTune('${p.id}')">Apply</button><span class="active-val" id="act_${p.id}">0.0000</span></div>`;
+    });
+
+    let threeReady = false, chartsReady = false;
+    let cubePivot, eulerHelper;
+    let chartAngles, chartRates, chartVel, chartCur;
+
+    // 3D Visualizer (Camera backed out to prevent clipping)
+    try {
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(50, 1, 0.1, 100); 
+        const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        renderer.setSize(container.clientWidth, container.clientWidth);
+        container.appendChild(renderer.domElement);
+
+        cubePivot = new THREE.Group();
+        scene.add(cubePivot);
+        eulerHelper = new THREE.Euler();
+
+        const geometry = new THREE.BoxGeometry(1.6, 1.6, 1.6); 
+        geometry.translate(0.8, 0.8, 0.8); 
+        const material = new THREE.MeshBasicMaterial({ color: 0x00ffff, transparent: true, opacity: 0.6 });
+        cubePivot.add(new THREE.Mesh(geometry, material));
+        cubePivot.add(new THREE.LineSegments(new THREE.EdgesGeometry(geometry), new THREE.LineBasicMaterial({ color: 0xffffff })));
+
+        const axesHelper = new THREE.AxesHelper(3.0);
+        axesHelper.geometry.attributes.color.setXYZ(0,0,1,0); axesHelper.geometry.attributes.color.setXYZ(1,0,1,0); 
+        axesHelper.geometry.attributes.color.setXYZ(2,0,0,1); axesHelper.geometry.attributes.color.setXYZ(3,0,0,1); 
+        axesHelper.geometry.attributes.color.setXYZ(4,1,0,0); axesHelper.geometry.attributes.color.setXYZ(5,1,0,0); 
+        cubePivot.add(axesHelper);
+
+        camera.position.set(6.0, 5.0, 3.0); 
+        camera.lookAt(0.8, 0.8, 0.8);
+
+        function animate() { requestAnimationFrame(animate); renderer.render(scene, camera); }
+        animate();
+        threeReady = true;
+
+        window.addEventListener('resize', () => {
+            camera.aspect = container.clientWidth / container.clientHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(container.clientWidth, container.clientHeight);
+        });
+    } catch (e) { console.error("3D Error:", e); }
+
+    // Chart Setup (Reordered Legends & Axes Units)
+    try {
+        const maxPoints = 50; 
+        const cOpts = { responsive: true, maintainAspectRatio: false, animation: false, elements: { point: { radius: 0 }, line: { borderWidth: 2, tension: 0.1 } }, scales: { x: { display: false }, y: { grid: { color: '#444' } } }, plugins: { legend: { labels: { color: '#ccc', boxWidth: 12 } } } };
+        function makeChart(ctxId, datasets, yLab) {
+            return new Chart(document.getElementById(ctxId).getContext('2d'), { type: 'line', data: { labels: Array(maxPoints).fill(''), datasets: datasets }, options: { ...cOpts, scales: { ...cOpts.scales, y: { ...cOpts.scales.y, title: { display: true, text: yLab, color: '#888' } } } } });
+        }
+        
+        // Order: Pitch(Red), Yaw(Blue), Roll(Green)
+        chartAngles = makeChart('chartAngles', [{label:'Pitch',borderColor:'#ff4444',data:Array(maxPoints).fill(0)},{label:'Yaw',borderColor:'#4444ff',data:Array(maxPoints).fill(0)},{label:'Roll',borderColor:'#44ff44',data:Array(maxPoints).fill(0)}], 'Angle (°)');
+        chartRates = makeChart('chartRates', [{label:'Pitch Rate',borderColor:'#ff4444',data:Array(maxPoints).fill(0)},{label:'Yaw Rate',borderColor:'#4444ff',data:Array(maxPoints).fill(0)},{label:'Roll Rate',borderColor:'#44ff44',data:Array(maxPoints).fill(0)}], 'Rate (°/s)');
+        
+        chartVel = makeChart('chartVel', [{label:'M1',borderColor:'#ff4444',data:Array(maxPoints).fill(0)},{label:'M2',borderColor:'#4444ff',data:Array(maxPoints).fill(0)},{label:'M3',borderColor:'#44ff44',data:Array(maxPoints).fill(0)}], 'Motor Velocity (rad/s)');
+        chartCur = makeChart('chartCur', [{label:'M1',borderColor:'#ff4444',data:Array(maxPoints).fill(0)},{label:'M2',borderColor:'#4444ff',data:Array(maxPoints).fill(0)},{label:'M3',borderColor:'#44ff44',data:Array(maxPoints).fill(0)}], 'Motor Torque');
+        chartsReady = true;
+    } catch (e) { console.error("Chart Error:", e); }
+
+    var ws = new WebSocket('ws://' + window.location.hostname + '/ws');
+    ws.onopen = function() {
+        document.getElementById('status').innerText = 'Telemetry (Live)';
+        document.getElementById('status').className = 'online';
+    };
+    ws.onclose = function() {
+        document.getElementById('status').innerText = 'Offline - Reconnecting...';
+        document.getElementById('status').className = 'offline';
+        setTimeout(() => location.reload(), 2000);
+    };
+
+    ws.onmessage = function(evt) {
+        var data = JSON.parse(evt.data);
+        const statusEl = document.getElementById('status');
+        if(statusEl.innerText !== 'Telemetry (Live)') {
+            statusEl.innerText = 'Telemetry (Live)';
+            statusEl.className = 'online';
+        }
+
+        const syncMap = { 'kp': data.sync_kp, 'ki': data.sync_ki, 'k1': data.sync_k1, 'k2': data.sync_k2, 'k3': data.sync_k3 };
+        for (let key in syncMap) { if (syncMap[key] !== undefined) document.getElementById('act_' + key).innerText = syncMap[key].toFixed(4); }
+
+        // Data processing (converting gyro rad/s to deg/s)
+        let r=0, y=0, p=data.p||0, pr=data.pr||0;
+        let rr = (data.g) ? data.g[0] * (180/Math.PI) : 0; 
+        let yr = (data.g) ? data.g[2] * (180/Math.PI) : 0;
+
+        if(threeReady && data.q && data.q.length === 4) {
+            cubePivot.quaternion.set(data.q[1], data.q[3], -data.q[2], data.q[0]);
+            eulerHelper.setFromQuaternion(cubePivot.quaternion, 'XYZ');
+            r = eulerHelper.x * (180/Math.PI); 
+            y = eulerHelper.y * (180/Math.PI);
+        }
+
+        if(data.mv && data.mc) {
+            document.getElementById('tel-m1').innerHTML = `<span style="color:#ff4444; font-weight:bold;">MOTOR 1 (PITCH)</span><br>Pitch: ${p.toFixed(1)}&deg; | Rate: ${pr.toFixed(1)}&deg;/s<br>Vel: ${data.mv[0].toFixed(1)} | Trq: ${data.mc[0].toFixed(2)}`;
+            document.getElementById('tel-m2').innerHTML = `<span style="color:#4444ff; font-weight:bold;">MOTOR 2 (YAW)</span><br>Yaw: ${y.toFixed(1)}&deg; | Rate: ${yr.toFixed(1)}&deg;/s<br>Vel: ${data.mv[1].toFixed(1)} | Trq: ${data.mc[1].toFixed(2)}`;
+            document.getElementById('tel-m3').innerHTML = `<span style="color:#44ff44; font-weight:bold;">MOTOR 3 (ROLL)</span><br>Roll: ${r.toFixed(1)}&deg; | Rate: ${rr.toFixed(1)}&deg;/s<br>Vel: ${data.mv[2].toFixed(1)} | Trq: ${data.mc[2].toFixed(2)}`;
+            
+            if(chartsReady){
+                chartVel.data.datasets[0].data.shift(); chartVel.data.datasets[0].data.push(data.mv[0]);
+                chartVel.data.datasets[1].data.shift(); chartVel.data.datasets[1].data.push(data.mv[1]);
+                chartVel.data.datasets[2].data.shift(); chartVel.data.datasets[2].data.push(data.mv[2]); chartVel.update('none');
+                
+                chartCur.data.datasets[0].data.shift(); chartCur.data.datasets[0].data.push(data.mc[0]);
+                chartCur.data.datasets[1].data.shift(); chartCur.data.datasets[1].data.push(data.mc[1]);
+                chartCur.data.datasets[2].data.shift(); chartCur.data.datasets[2].data.push(data.mc[2]); chartCur.update('none');
+            }
+        }
+        
+        if(chartsReady){
+            // Order applied: Pitch(0), Yaw(1), Roll(2)
+            chartAngles.data.datasets[0].data.shift(); chartAngles.data.datasets[0].data.push(p);
+            chartAngles.data.datasets[1].data.shift(); chartAngles.data.datasets[1].data.push(y);
+            chartAngles.data.datasets[2].data.shift(); chartAngles.data.datasets[2].data.push(r); chartAngles.update('none');
+            
+            chartRates.data.datasets[0].data.shift(); chartRates.data.datasets[0].data.push(pr);
+            chartRates.data.datasets[1].data.shift(); chartRates.data.datasets[1].data.push(yr);
+            chartRates.data.datasets[2].data.shift(); chartRates.data.datasets[2].data.push(rr); chartRates.update('none');
+        }
+    };
+
+    function sendCmd(cmd, v1, v2=0) { ws.send(JSON.stringify({cmd: cmd, state: v1, edge: v2})); }
+    function sendTune(id) {
+        let i = document.getElementById('val_'+id), v = parseFloat(i.value);
+        if(isNaN(v)) return;
+        if(id==='kp'||id==='ki'){ ws.send(JSON.stringify({cmd:'tune_pi',kp:(id==='kp')?v:parseFloat(document.getElementById('act_kp').innerText),ki:(id==='ki')?v:parseFloat(document.getElementById('act_ki').innerText)})); }
+        else { ws.send(JSON.stringify({cmd:'tune_lqr',k1:(id==='k1')?v:parseFloat(document.getElementById('act_k1').innerText),k2:(id==='k2')?v:parseFloat(document.getElementById('act_k2').innerText),k3:(id==='k3')?v:parseFloat(document.getElementById('act_k3').innerText)})); }
+        i.value='';
+    }
+</script>
+</body>
+</html>

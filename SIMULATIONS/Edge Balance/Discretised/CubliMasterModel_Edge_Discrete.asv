@@ -1,0 +1,224 @@
+%% Initialisation
+g = 9.81;
+Cb = 0; % Damping coefficient for the body
+l = sqrt((0.15/2)^2*2);
+alphad = 0;
+
+Mbody = 0.25;
+
+% Core Parameters
+M_core = 70; % g including peripheral PCBs, fasteners, and cables
+COM_core = [51.684 51.705 51.556]; % mm
+I_core = [5.719 5.717 5.713]*10^5; % g*mm^2
+P_core = [-1.625 -1.628 -1.628]*10^5; % g*mm^2
+
+% Battery Parameters
+M_battery = 100; % g
+
+% Frame Parameters
+M_frame = 6*6 + 2.5*4; % g including fasteners and corner joints
+
+% Motor and Reaction Wheel Parameters
+Tmax = 0.25; % Max Torque Nm
+Kd = [0,0,0];
+KV = 195;
+Kt = 0.05; % Nm/A
+Cw = 0.05*10^-3; % Damping coefficient for the wheel
+TorqueRate = 1/0.005; 
+Motor_Resistance = (0.54+0.535+0.535)/3;
+
+Mmotor = 0.11;
+Mwheel = 0.145;
+Macctuator = Mmotor + Mwheel; % kg
+
+% PCB Parameters
+M_PCB = 106.6; % g
+
+% Mass Verification
+M_total = M_PCB + 1000*Macctuator*3 + M_frame + M_battery + M_core;
+
+% Noise
+Encoder_np = 2e-10;
+Encoder_st = 9e-5;
+IMU_acc_np = 1.73e-7;
+IMU_gyro_np = 3.81e-9;
+IMU_st = 0.005;
+
+% Discretisation 
+Ts = 0.005;
+
+%% Parameters
+rb = out.rb(3);
+Ib = out.Ib(5);
+mw = out.mw1(1); % Mass of the wheel
+mb = out.mb(1); % Mass of Body excl. wheel and motor
+Iw = out.Iw1(9); % Moment of inertia of the wheel and motor
+
+%% State Space Form
+% x = [theta_b; theta_dot_b; theta_dot_w];
+
+A = [0, 1, 0;
+    (mb*rb+mw*l)*g/(Ib+mw*l^2), -Cb/(Ib+mw*l^2), Cw/(Ib+mw*l^2);
+    -(mb*rb+mw*l)*g/(Ib+mw*l^2), Cb/(Ib+mw*l^2), -Cw*(Ib+Iw+mw*l^2)/(Iw*(Ib+mw*l^2))];
+
+B = [0;
+    -Kt/(Ib+mw*l^2);
+    Kt*(Ib+Iw+mw*l^2)/(Iw*(Ib+mw*l^2))];
+
+n = 3; m = 1;
+
+Co = ctrb(A,B);
+rankCo = rank(Co);
+
+%% Poles
+poles = eig(A);
+Tconstant = 1/poles(1);
+SF_Ts = Tconstant/ Ts;
+
+% Low-pass filter
+alpha = 0.02;
+
+%% Discretisation
+sys_c = ss(A, B, eye(3), 0);
+
+sys_d = c2d(sys_c, Ts, 'zoh');
+
+Ad = sys_d.A;
+Bd = sys_d.B;
+
+%% Bryson's Rule
+Q11 = 1/(0.5*pi/180)^2; % Max displacement
+Q22 = 1/(2)^2; % Max cube velocity
+Q33 = 1/(300*(2*pi)/60); % Max wheel velocity
+
+Q_bryson = diag([Q11, Q22, Q33]);
+R_bryson = 1/0.5^2; % Maximum current/voltage
+
+%% Manual Weights
+Q = diag([100, 40, 1]); % theta_b; theta_dot_b; theta_dot_w, alpha
+R = 10;
+
+%% Discrete LQR
+[Kd, S, P] = dlqr(Ad, Bd, Q_bryson, R_bryson);
+
+% Copy command
+cpp_output = sprintf([...
+    '    K[1] = %.4ff;  // Cube Angle (Theta)\n', ...
+    '    K[2] = %.4ff;  // Cube Velocity (Theta_dot)\n', ...
+    '    K[3] = %.4ff;  // Wheel Velocity'], ...
+    Kd(1), Kd(2), Kd(3));
+clipboard('copy', cpp_output);
+fprintf('--- K-Matrix copied to clipboard! ---\n%s\n', cpp_output);
+
+%% Bode Plot
+wc_vals = logspace(-1, 1.301, 100); % 100 points between 0.1 and 20
+phase_margins = zeros(length(wc_vals), 1);
+
+% 4. RUN THE SWEEP
+for i = 1:length(wc_vals)
+    wc = wc_vals(i);
+    
+    % Build the 4x4 Augmented A Matrix
+    % Filter dynamics: dot_vf = wc * v_wheel - wc * v_f
+    A_aug = [ A(1,1)  A(1,2)  A(1,3)   0;
+              A(2,1)  A(2,2)  A(2,3)   0;
+              A(3,1)  A(3,2)  A(3,3)   0;
+              0       0       wc      -wc ];
+          
+    % Build the Augmented B Matrix
+    B_aug = [ B(1); B(2); B(3); 0 ];
+    
+    % Calculate the rigorous LQR gains for this specific wc
+    K_aug = lqr(A_aug, B_aug, Q_bryson, R_bryson);
+    
+    % Create the Loop Transfer Function: L(s) = K * (sI - A)^-1 * B
+    % We use MATLAB's 'ss' (state-space) command to break the loop
+    sys_open_loop = ss(A_aug, B_aug, K_aug, 0);
+    
+    % Extract the Phase Margin
+    [~, PM, ~, ~] = margin(sys_open_loop);
+    
+    % Store the result
+    phase_margins(i) = PM;
+end
+
+% 5. PLOT THE RESULTS
+figure('Name', 'Rigorous Filter Design');
+semilogx(wc_vals, phase_margins, 'LineWidth', 2.5, 'Color', '#0072BD');
+hold on; grid on;
+
+% Draw the 45-degree danger line
+yline(45, 'r--', 'Minimum Safe Phase Margin (45°)', 'LineWidth', 2, 'LabelHorizontalAlignment', 'left');
+
+title('Phase Margin vs. LPF Cutoff Frequency (\omega_c)', 'FontSize', 14);
+xlabel('Filter Cutoff \omega_c (rad/s)', 'FontSize', 12);
+ylabel('Phase Margin (Degrees)', 'FontSize', 12);
+xlim([0.1 20]);
+ylim([20 100]);
+
+%% Simscape Scopes
+
+% Clean up workspace and close old figures before running
+close all;
+
+% 1. Force LaTeX formatting AND set global, highly readable font sizes
+set(groot, 'defaultTextInterpreter', 'latex');
+set(groot, 'defaultAxesTickLabelInterpreter', 'latex');
+set(groot, 'defaultLegendInterpreter', 'latex');
+
+% Set the baseline font size for all axis ticks and labels (12pt is great for A4)
+set(groot, 'defaultAxesFontSize', 12); 
+set(groot, 'defaultTextFontSize', 12);
+
+% 2. Create figure with LOCKED physical dimensions
+fig = figure('Name', 'Robot Balancing Dynamics', 'Units', 'centimeters', 'Position', [5, 5, 16, 12]);
+
+% 3. Use tiledlayout
+t = tiledlayout(2, 2, 'TileSpacing', 'compact', 'Padding', 'compact');
+
+% ---------------------------------------------------------
+% Tile 1: Cube Position (Top Left)
+% ---------------------------------------------------------
+ax1 = nexttile;
+plot(out.Position.Time, out.Position.Data, 'LineWidth', 1.5, 'Color', '#0072BD');
+grid on; box on;
+title('Cube Orientation $\theta_b$', 'FontSize', 11);
+ylabel('Position (rad)', 'FontSize', 10);
+% Notice: No xlabel here. It wastes space since the X-axis is shared.
+
+% ---------------------------------------------------------
+% Tile 2: Wheel Velocity (Top Right)
+% ---------------------------------------------------------
+ax2 = nexttile;
+plot(out.Wheel_Velocity.Time, out.Wheel_Velocity.Data, 'LineWidth', 1.5, 'Color', '#D95319');
+grid on; box on;
+title('Wheel Velocity $\dot \theta_w$', 'FontSize', 14);
+ylabel('Velocity (rad/s)', 'FontSize', 12);
+
+% ---------------------------------------------------------
+% Tile 3: Cube Velocity (Bottom Left)
+% ---------------------------------------------------------
+ax3 = nexttile;
+plot(out.Cube_Velocity.Time, out.Cube_Velocity.Data, 'LineWidth', 1.5, 'Color', '#EDB120');
+grid on; box on;
+title('Cube Velocity $\dot \theta_b$', 'FontSize', 14);
+ylabel('Velocity (rad/s)', 'FontSize', 12);
+xlabel('Time (s)', 'FontSize', 12); % Bottom row gets the X-labels
+
+% ---------------------------------------------------------
+% Tile 4: Control Torque (Bottom Right)
+% ---------------------------------------------------------
+ax4 = nexttile;
+plot(out.Torque.Time, out.Torque.Data, 'LineWidth', 1.5, 'Color', '#7E2F8E');
+grid on; box on;
+title('Control Torque $u$', 'FontSize', 11);
+ylabel('Torque (N$\cdot$m)', 'FontSize', 10);
+xlabel('Time (s)', 'FontSize', 12); 
+
+% ---------------------------------------------------------
+% Link Axes & Export
+% ---------------------------------------------------------
+linkaxes([ax1, ax2, ax3, ax4], 'x');
+
+% 4. Export directly to a vector PDF! 
+exportgraphics(fig, 'Balancing_Dynamics.pdf', 'ContentType', 'vector');

@@ -1,25 +1,20 @@
 #include "IMU.h"
 #include <cmath>
 
-// CHANGED: Constructor accepts the SPI pointer and initializes is_seeded to false
 IMU_Sensor::IMU_Sensor(int8_t cs, SPIClass* spi_bus) :
     _cs(cs), _spi(spi_bus),
     gx_bias(0.0f), gy_bias(0.0f), gz_bias(0.0f),
     ax_bias(0.0f), ay_bias(0.0f),
     current_pitch(0.0f), current_pitch_rate(0.0f),
-    is_seeded(false), lastFilterTime(0) {}
+    is_seeded(false), lastFilterTime(0),
+    ax(0), ay(0), az(0), gx(0), gy(0), gz(0) {} // Initialize new members
 
 bool IMU_Sensor::init() {
-    // CHANGED: Use the Adafruit hardware SPI overload!
-    if (!ism.begin_SPI(_cs, _spi)) {
-        return false;
-    }
-
+    if (!ism.begin_SPI(_cs, _spi)) return false;
     ism.setAccelRange(LSM6DS_ACCEL_RANGE_2_G);
     ism.setGyroRange(LSM6DS_GYRO_RANGE_250_DPS);
     ism.setAccelDataRate(LSM6DS_RATE_416_HZ);
     ism.setGyroDataRate(LSM6DS_RATE_416_HZ);
-
     lastFilterTime = micros();
     return true;
 }
@@ -50,36 +45,33 @@ void IMU_Sensor::calibrate() {
     gx_bias = sumGX / CALIB_SAMPLES;
     gy_bias = sumGY / CALIB_SAMPLES;
     gz_bias = sumGZ / CALIB_SAMPLES;
-
     Serial.println("IMU Calibration done!");
 }
 
 void IMU_Sensor::update() {
     unsigned long now = micros();
     float dt = (now - lastFilterTime) / 1000000.0f;
-    
     if (dt > 0.05f) dt = 0.002f; 
-    
     lastFilterTime = now;
 
     sensors_event_t accel, gyro, temp;
     ism.getEvent(&accel, &gyro, &temp);
 
-    // Fetch ALL axes (we need Y and Z now for the 3D correction)
-    float gx = gyro.gyro.x - gx_bias; 
-    float gy = gyro.gyro.y - gy_bias;
-    float gz = gyro.gyro.z - gz_bias; 
+    // CHANGED: Assign directly to class members, NOT local variables!
+    gx = gyro.gyro.x - gx_bias; 
+    gy = gyro.gyro.y - gy_bias;
+    gz = gyro.gyro.z - gz_bias; 
     
-    float ax = accel.acceleration.x - ax_bias;
-    float ay = accel.acceleration.y - ay_bias; // Lateral acceleration
-    float az = accel.acceleration.z; 
+    ax = accel.acceleration.x - ax_bias;
+    ay = accel.acceleration.y - ay_bias; 
+    az = accel.acceleration.z; 
 
-    if (abs(gy) < 0.001f) gy = 0.0f;
+    // Use a temporary variable for the math so we don't permanently zero out the telemetry 'gy'
+    float math_gy = gy;
+    if (abs(math_gy) < 0.001f) math_gy = 0.0f;
 
-    current_pitch_rate = gy * 1.018791f;
+    current_pitch_rate = math_gy * 1.018791f;
 
-    // 1. UPGRADED: 3D-Aware Accelerometer Pitch (Radians)
-    // This perfectly calculates pitch even if the robot is rolled or yawed
     float accel_pitch_rad = atan2(-ax, sqrt(ay * ay + az * az)) * 1.018791f;
 
     if (!is_seeded) {
@@ -87,25 +79,28 @@ void IMU_Sensor::update() {
         is_seeded = true;
     }
 
-    // 2. UPGRADED: Adaptive Gain Logic with Yaw Lockout
     float accel_mag = sqrt(ax * ax + ay * ay + az * az);
     float alpha = BASE_ALPHA;
 
-    // If linear acceleration is violent OR if the robot is yawing/twisting heavily (> 0.5 rad/s)
     if (abs(accel_mag - GRAVITY) > ACCEL_TOLERANCE || abs(gz) > 0.5f) {
-        // High centrifugal force detected! 
-        // 100% trust in Gyro, completely ignore the Accelerometer's lies.
         alpha = 1.0f; 
     }
 
-    // Complementary Filter Math
-    current_pitch = alpha * (current_pitch + gy * dt) + (1.0f - alpha) * accel_pitch_rad;
+    current_pitch = alpha * (current_pitch + math_gy * dt) + (1.0f - alpha) * accel_pitch_rad;
 }
 
-float IMU_Sensor::getPitch() {
-    return current_pitch - PITCH_EQUILIBRIUM_TRIM;
-}
+// --- Original Getters ---
+float IMU_Sensor::getPitch() { return current_pitch - PITCH_EQUILIBRIUM_TRIM; }
+float IMU_Sensor::getPitchRate() { return current_pitch_rate; }
 
-float IMU_Sensor::getPitchRate() {
-    return current_pitch_rate;
-}
+// --- NEW GETTERS & SETTERS ---
+float IMU_Sensor::getAccelX() { return ax; }
+float IMU_Sensor::getAccelY() { return ay; }
+float IMU_Sensor::getAccelZ() { return az; }
+
+float IMU_Sensor::getGyroX() { return gx; }
+float IMU_Sensor::getGyroY() { return gy; }
+float IMU_Sensor::getGyroZ() { return gz; }
+
+void IMU_Sensor::setAlpha(float alpha) { BASE_ALPHA = alpha; }
+void IMU_Sensor::setAccelTolerance(float tol) { ACCEL_TOLERANCE = tol; }

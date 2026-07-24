@@ -1,26 +1,16 @@
 #include "InterchipComms.h"
 
-// Static pointer so the library callback knows which object to update
 static InterchipComms* commsInstance = nullptr;
 
-// --------------------------------------------------------
-// CONSTRUCTOR
-// --------------------------------------------------------
 InterchipComms::InterchipComms(HardwareSerial& serialPort, int rxPin, int txPin)
-    : _serial(serialPort), _rxPin(rxPin), _txPin(txPin), 
-      _latestTarget(0.0f), _remoteFaultCode(0), _lastPacketTime(0),
-      _m2Vel(0.0f), _m3Vel(0.0f), _m2Cur(0.0f), _m3Cur(0.0f) {}
+    : _serial(serialPort), _rxPin(rxPin), _txPin(txPin) {
+    _lastPacketTime.store(0);
+}
 
-// --------------------------------------------------------
-// SETUP & UPDATE
-// --------------------------------------------------------
 void InterchipComms::begin(unsigned long baudRate) {
-    commsInstance = this; // Link the pointer to this specific object
-    
+    commsInstance = this;
     _serial.begin(baudRate, SERIAL_8N1, _rxPin, _txPin);
     _cobsSerial.setStream(&_serial);
-    
-    // Use the standard function name the library expects
     _cobsSerial.setPacketHandler(&InterchipComms::onPacketReceived); 
 }
 
@@ -28,68 +18,153 @@ void InterchipComms::update() {
     _cobsSerial.update();
 }
 
-// --------------------------------------------------------
-// SENDING DATA
-// --------------------------------------------------------
-void InterchipComms::setTelemetry(float m2Vel, float m3Vel, float m2Cur, float m3Cur) {
-    _m2Vel.store(m2Vel);
-    _m3Vel.store(m3Vel);
-    _m2Cur.store(m2Cur);
-    _m3Cur.store(m3Cur);
+// ==========================================
+// SETTERS (Write to Atomic Storage)
+// ==========================================
+void InterchipComms::setPI(float kp, float ki) { _kp.store(kp); _ki.store(ki); }
+void InterchipComms::setLQRWeights(float k1, float k2, float k3) { _k1.store(k1); _k2.store(k2); _k3.store(k3); }
+void InterchipComms::setIMUTuning(float alpha, float accelTol) { _alpha.store(alpha); _accelTol.store(accelTol); }
+void InterchipComms::setRobotState(uint8_t state, uint8_t edge) { _robotState.store(state); _targetEdge.store(edge); }
+void InterchipComms::setPitchTarget(float pitchTarget) { _targetPitch.store(pitchTarget); }
+void InterchipComms::setMotorTargets(float t1, float t2, float t3) { _t1.store(t1); _t2.store(t2); _t3.store(t3); }
+
+void InterchipComms::setTelemetryMotors(float v1, float v2, float v3, float c1, float c2, float c3) {
+    _m1v.store(v1); _m2v.store(v2); _m3v.store(v3);
+    _m1c.store(c1); _m2c.store(c2); _m3c.store(c3);
+}
+void InterchipComms::setTelemetryIMU(float ax, float ay, float az, float gx, float gy, float gz) {
+    _ax.store(ax); _ay.store(ay); _az.store(az);
+    _gx.store(gx); _gy.store(gy); _gz.store(gz);
+}
+void InterchipComms::setTelemetryKinematics(float pitch, float pitchRate, uint32_t fault) {
+    _pitch.store(pitch); _pitchRate.store(pitchRate); _faultCode.store(fault);
 }
 
-void InterchipComms::sendPacket(float target, uint32_t faultCode) {
-    InterchipPacket packet;
-    packet.targetCurrent = target;
-    packet.faultCode = faultCode;
+// ==========================================
+// PACKET TRANSMISSION
+// ==========================================
+void InterchipComms::sendCommandPacket() { // Call this from Wi-Fi MCU
+    InterchipPacket p;
+    // Load local commands into packet
+    p.target1 = _t1.load(); p.target2 = _t2.load(); p.target3 = _t3.load(); p.targetPitch = _targetPitch.load();
+    p.Kp_outer = _kp.load(); p.Ki_outer = _ki.load();
+    p.k1 = _k1.load(); p.k2 = _k2.load(); p.k3 = _k3.load();
+    p.BASE_ALPHA = _alpha.load(); p.ACCEL_TOLERANCE = _accelTol.load();
+    p.robotState = _robotState.load(); p.targetEdge = _targetEdge.load();
+    _cobsSerial.send((uint8_t*)&p, sizeof(InterchipPacket));
+}
+
+void InterchipComms::sendTelemetryPacket() { // Call this from Control MCU
+    InterchipPacket p;
+    // Load local telemetry into packet
+    p.faultCode = _faultCode.load();
+    p.motor1Velocity = _m1v.load(); p.motor2Velocity = _m2v.load(); p.motor3Velocity = _m3v.load();
+    p.motor1Current = _m1c.load(); p.motor2Current = _m2c.load(); p.motor3Current = _m3c.load();
+    p.ax = _ax.load(); p.ay = _ay.load(); p.az = _az.load();
+    p.gx = _gx.load(); p.gy = _gy.load(); p.gz = _gz.load();
+    p.pitch = _pitch.load(); p.pitchRate = _pitchRate.load();
+
+    p.active_Kp_outer = _act_kp.load();
+    p.active_Ki_outer = _act_ki.load();
+    p.active_k1 = _act_k1.load();
+    p.active_k2 = _act_k2.load();
+    p.active_k3 = _act_k3.load();
     
-    // Load local telemetry state into the packet before sending
-    packet.motor2Velocity = _m2Vel.load();
-    packet.motor3Velocity = _m3Vel.load();
-    packet.motor2Current = _m2Cur.load();
-    packet.motor3Current = _m3Cur.load();
-
-    _cobsSerial.send((uint8_t*)&packet, sizeof(InterchipPacket));
+    _cobsSerial.send((uint8_t*)&p, sizeof(InterchipPacket));
 }
 
-// --------------------------------------------------------
-// GETTERS & SAFETY
-// --------------------------------------------------------
-float InterchipComms::getTargetCurrent() { return _latestTarget.load(); }
-uint32_t InterchipComms::getRemoteFaultCode() { return _remoteFaultCode.load(); }
-
-float InterchipComms::getMotor2Velocity() { return _m2Vel.load(); }
-float InterchipComms::getMotor3Velocity() { return _m3Vel.load(); }
-float InterchipComms::getMotor2Current() { return _m2Cur.load(); }
-float InterchipComms::getMotor3Current() { return _m3Cur.load(); }
-
-bool InterchipComms::isConnectionAlive(uint32_t timeoutMs) {
-    if (_lastPacketTime.load() == 0) return false; 
-    return (millis() - _lastPacketTime.load()) <= timeoutMs;
-}
-
-// --------------------------------------------------------
+// ==========================================
 // RECEIVE CALLBACK
-// --------------------------------------------------------
+// ==========================================
 void InterchipComms::onPacketReceived(const uint8_t* buffer, size_t size) {
-    // Safety check: make sure the object exists
     if (commsInstance == nullptr) return; 
-
     if (size == sizeof(InterchipPacket)) {
-        InterchipPacket packet;
-        memcpy(&packet, buffer, size);
+        InterchipPacket p;
+        memcpy(&p, buffer, size);
         
-        // Update targets and faults using our new static pointer
-        commsInstance->_latestTarget.store(packet.targetCurrent);
-        commsInstance->_remoteFaultCode.store(packet.faultCode);
+        // Unpack everything into Atomic storage
+        commsInstance->_t1.store(p.target1); commsInstance->_t2.store(p.target2); commsInstance->_t3.store(p.target3);
+        commsInstance->_targetPitch.store(p.targetPitch);
+        commsInstance->_kp.store(p.Kp_outer); commsInstance->_ki.store(p.Ki_outer);
+        commsInstance->_k1.store(p.k1); commsInstance->_k2.store(p.k2); commsInstance->_k3.store(p.k3);
+        commsInstance->_alpha.store(p.BASE_ALPHA); commsInstance->_accelTol.store(p.ACCEL_TOLERANCE);
+        commsInstance->_robotState.store(p.robotState); commsInstance->_targetEdge.store(p.targetEdge);
         
-        // Update telemetry data
-        commsInstance->_m2Vel.store(packet.motor2Velocity);
-        commsInstance->_m3Vel.store(packet.motor3Velocity);
-        commsInstance->_m2Cur.store(packet.motor2Current);
-        commsInstance->_m3Cur.store(packet.motor3Current);
+        commsInstance->_faultCode.store(p.faultCode);
+        commsInstance->_m1v.store(p.motor1Velocity); commsInstance->_m2v.store(p.motor2Velocity); commsInstance->_m3v.store(p.motor3Velocity);
+        commsInstance->_m1c.store(p.motor1Current); commsInstance->_m2c.store(p.motor2Current); commsInstance->_m3c.store(p.motor3Current);
+        commsInstance->_ax.store(p.ax); commsInstance->_ay.store(p.ay); commsInstance->_az.store(p.az);
+        commsInstance->_gx.store(p.gx); commsInstance->_gy.store(p.gy); commsInstance->_gz.store(p.gz);
+        commsInstance->_pitch.store(p.pitch); commsInstance->_pitchRate.store(p.pitchRate);
+
+        commsInstance->_act_kp.store(p.active_Kp_outer);
+        commsInstance->_act_ki.store(p.active_Ki_outer);
+        commsInstance->_act_k1.store(p.active_k1);
+        commsInstance->_act_k2.store(p.active_k2);
+        commsInstance->_act_k3.store(p.active_k3);
         
-        // Reset watchdog timer
         commsInstance->_lastPacketTime.store(millis()); 
     }
 }
+
+// --- Basic Getters ---
+bool InterchipComms::isConnectionAlive(uint32_t timeoutMs) { return (millis() - _lastPacketTime.load()) <= timeoutMs; }
+uint32_t InterchipComms::getFaultCode() { return _faultCode.load(); }
+float InterchipComms::getPitch() { return _pitch.load(); }
+
+float InterchipComms::getKpOuter() { return _kp.load(); }
+float InterchipComms::getKiOuter() { return _ki.load(); }
+float InterchipComms::getK1() { return _k1.load(); }
+float InterchipComms::getK2() { return _k2.load(); }
+float InterchipComms::getK3() { return _k3.load(); }
+float InterchipComms::getBaseAlpha() { return _alpha.load(); }
+float InterchipComms::getAccelTol() { return _accelTol.load(); }
+uint8_t InterchipComms::getRobotState() { return _robotState.load(); }
+uint8_t InterchipComms::getTargetEdge() { return _targetEdge.load(); }
+float InterchipComms::getTargetPitch() { return _targetPitch.load(); }
+
+// --- Telemetry (Slave reads these) ---
+float InterchipComms::getPitchRate() { return _pitchRate.load(); }
+
+// Motor Current Getter
+float InterchipComms::getMotorCur(int motor) {
+    if (motor == 1) return _m1c.load();
+    if (motor == 2) return _m2c.load();
+    if (motor == 3) return _m3c.load();
+    return 0.0f;
+}
+
+// Motor Velocity Getter
+float InterchipComms::getMotorVel(int motor) {
+    if (motor == 1) return _m1v.load();
+    if (motor == 2) return _m2v.load();
+    if (motor == 3) return _m3v.load();
+    return 0.0f;
+}
+
+// IMU Getter
+float InterchipComms::getIMU(char axis, char type) {
+    if (type == 'a') {
+        if (axis == 'x') return _ax.load();
+        if (axis == 'y') return _ay.load();
+        if (axis == 'z') return _az.load();
+    } else if (type == 'g') {
+        if (axis == 'x') return _gx.load();
+        if (axis == 'y') return _gy.load();
+        if (axis == 'z') return _gz.load();
+    }
+    return 0.0f;
+}
+
+// Add the setter
+void InterchipComms::setTelemetryTuning(float kp, float ki, float k1, float k2, float k3) {
+    _act_kp.store(kp); _act_ki.store(ki); 
+    _act_k1.store(k1); _act_k2.store(k2); _act_k3.store(k3);
+}
+
+// Add the getters
+float InterchipComms::getActiveKp() { return _act_kp.load(); }
+float InterchipComms::getActiveKi() { return _act_ki.load(); }
+float InterchipComms::getActiveK1() { return _act_k1.load(); }
+float InterchipComms::getActiveK2() { return _act_k2.load(); }
+float InterchipComms::getActiveK3() { return _act_k3.load(); }

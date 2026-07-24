@@ -4,65 +4,56 @@
 #include "VoltageMonitor.h"
 #include "IMU.h"
 #include "LQR.h"
-#include "WebDashboard.h"
 #include "InterchipComms.h"
 #include <atomic>
-#include <ArduinoJson.h>
 
-// Thread-safe mailboxes between Core 0 and Core 1
+// Define a custom fault code for the web dashboard Disable button
+#define FAULT_USER_DISABLE 0x80000000 
+
+// --- Active Parameters ---
+float lqr_k1 = DEFAULT_LQR_K1;
+float lqr_k2 = DEFAULT_LQR_K2;
+float lqr_k3 = DEFAULT_LQR_K3;
+
+float Kp_outer = DEFAULT_KP_OUTER; 
+float Ki_outer = DEFAULT_KI_OUTER;
+
+// --- Initialisation ---
+float target = 0.0f;
+float target_angle = 0.0f;
+float wheel_velocity_integral = 0.0f;
+
+// --- Thread-safe mailboxes between Core 0 and Core 1 ---
 std::atomic<float> shared_target_torque(0.0f);
 std::atomic<float> shared_motor_velocity(0.0f);
 std::atomic<float> shared_motor_iq(0.0f);
 
-// Make sure your spinlock flags are volatile so the compiler doesn't optimize them away!
 volatile std::atomic<bool> spiRequested(false);
 volatile std::atomic<bool> spiSafeToUse(false);
 
+// --- Global Objects ---
 SPIClass hwSpi(1);
 HardwareSerial uartLink(1); 
 Driver motor1(Motor1Pins, MotorTuning); 
 VoltageMonitor battery(VSENSE_PIN, VSENSE_DIVIDER_RATIO, VSENSE_TRIM);
 InterchipComms comms(uartLink, MASTER_RX, MASTER_TX); 
-
-float target = 0.0f;
-
-float target_angle = 0.0f;
-float wheel_velocity_integral = 0.0f;
-
-// Outer Loop PI Gains (Start very small!)
-float Kp_outer = 0.003f; 
-float Ki_outer = 0.0005f;
-
-// Instantiate globally with your specific SPI pins
 IMU_Sensor imu(ISM_CS, &hwSpi);
-
 LQR lqr;
 
-Commander command = Commander(Serial);
-
+// =======================================================
+// CORE 1: MOTOR CONTROL TASK (Fast Loop)
+// =======================================================
 void taskFOC(void * pvParameters) {
     vTaskDelay(pdMS_TO_TICKS(500));
-    // 1. Assassinate the Watchdog on Core 1 so we never have to yield!
     disableCore1WDT(); 
-
-    // 2. Set this specific task to the highest possible FreeRTOS priority
     vTaskPrioritySet(NULL, configMAX_PRIORITIES - 1);
 
     for(;;) {
-        // 1. The Spinlock Handshake
         if (spiRequested.load()) {
-            // Core 0 needs the bus. Grant access.
             spiSafeToUse.store(true); 
-            
-            // Spin in place and wait for Core 0 to finish reading SPI sensors
-            while (spiRequested.load()) { 
-                // Do nothing. Just wait.
-            }
-            
-            // Core 0 is done. Revoke access and resume math.
+            while (spiRequested.load()) { /* Spin and wait */ }
             spiSafeToUse.store(false); 
         } else {
-            //motor1.setTarget(0.0f);
             motor1.setTarget(shared_target_torque.load());
             motor1.runFOC(); 
             shared_motor_velocity.store(motor1.getVelocity());
@@ -71,56 +62,54 @@ void taskFOC(void * pvParameters) {
     }
 }
 
-void onKpOuter(char* cmd) { 
-    command.scalar(&Kp_outer, cmd); 
-    Serial.printf("Kp_outer set to: %.6f\n", Kp_outer);
-}
-
-void onKiOuter(char* cmd) { 
-    command.scalar(&Ki_outer, cmd); 
-    Serial.printf("Ki_outer set to: %.6f\n", Ki_outer);
-}
-
+// =======================================================
+// CORE 0: LQR & TELEMETRY TASK (200Hz)
+// =======================================================
 void taskLQR(void *pvParameters) {
     uint32_t currentFaults = FAULT_NONE;
     static uint32_t lastFaults = 0xFFFFFFFF; 
     static uint32_t lastPrintTime = 0;
-    const uint32_t PRINT_INTERVAL_MS = 200; 
 
     TickType_t xLastWakeTime = xTaskGetTickCount();
-    const TickType_t xFrequency = pdMS_TO_TICKS(5); // 200 Hz LQR loop
+    const TickType_t xFrequency = pdMS_TO_TICKS(TASK_LOOP_FREQUENCY); // 200 Hz
+    const float dt = TASK_LOOP_FREQUENCY / 1000.0f; // Calculate dt strictly from config
 
     for(;;) {
         currentFaults = FAULT_NONE; 
 
+        // --- 1. FAULT MONITORING ---
         if (battery.isUnderVoltage(BATTERY_SAFE_MIN)) currentFaults |= FAULT_UNDER_VOLTAGE;
         if (battery.isOverVoltage(BATTERY_SAFE_MAX))  currentFaults |= FAULT_OVER_VOLTAGE;
-        if (!comms.isConnectionAlive(15))             currentFaults |= FAULT_COMMS_LOST;
-
+        
         comms.update(); 
-        if (Serial.available()) {
-            userTargetCurrent = Serial.parseFloat(); 
-            while(Serial.available()) { Serial.read(); } 
-        }
+        if (!comms.isConnectionAlive(100)) currentFaults |= FAULT_COMMS_LOST;
+        if (comms.getRobotState() == 0) currentFaults |= FAULT_USER_DISABLE;
 
-        command.run();
-
-        // =======================================================
-        // BULLETPROOF SPI BUS ACCESS
-        // =======================================================
-        spiRequested.store(true); // 1. Ask Core 1 for the bus
+        // --- 2. APPLY INCOMING TUNING PARAMETERS ---
+        // PI Tuning
+        if (comms.getKpOuter() > 0.00001f) Kp_outer = comms.getKpOuter();
+        if (comms.getKiOuter() > 0.00001f) Ki_outer = comms.getKiOuter();
         
-        while (!spiSafeToUse.load()) { 
-            // 2. Wait right here until Core 1 finishes its math and grants access
-            delayMicroseconds(1); 
+        // LQR Tuning (Ignore exact 0.0f on boot)
+        if (comms.getK1() != 0.0f) { 
+            lqr_k1 = comms.getK1();
+            lqr_k2 = comms.getK2();
+            lqr_k3 = comms.getK3();
+            lqr.setGains(lqr_k1, lqr_k2, lqr_k3);
         }
 
-        // 3. We now have 100% exclusive, safe access to the SPI hardware!
+        // IMU Tuning
+        if (comms.getBaseAlpha() > 0.0f) imu.setAlpha(comms.getBaseAlpha());
+        if (comms.getAccelTol() > 0.0f) imu.setAccelTolerance(comms.getAccelTol());
+
+        // --- 3. BULLETPROOF SPI BUS ACCESS ---
+        spiRequested.store(true); 
+        while (!spiSafeToUse.load()) { delayMicroseconds(1); }
+
         if (motor1.hasHardwareFault()) currentFaults |= FAULT_DRV1;
-
-        currentFaults |= comms.getRemoteFaultCode(); 
+        currentFaults |= comms.getFaultCode(); 
         
-        // State Machine (emergencyStop/enable might send SPI commands to the DRV chip)
+        // State Machine execution during safe SPI window
         if (currentFaults != lastFaults) {
             if (currentFaults != FAULT_NONE) {
                 motor1.emergencyStop();
@@ -131,129 +120,96 @@ void taskLQR(void *pvParameters) {
             lastFaults = currentFaults;
         }
 
-        imu.update(); // Automatically calculates dt and updates state!
-
-        spiRequested.store(false);
+        imu.update(); // Calculate internal kinematics
+        spiRequested.store(false); // RELEASE SPI BUS!
         
         float current_wheel_vel = shared_motor_velocity.load();
         
-        // ==========================================
-        // OUTER LOOP: Shift target angle based on wheel speed
-        // ==========================================
-        if (currentFaults == FAULT_NONE && abs(imu.getPitch()) < 0.35f) {
+        // --- 4. OUTER LOOP (PI) ---
+        if (currentFaults == FAULT_NONE && abs(imu.getPitch()) < ANGLE_THRESHOLD) {
+            wheel_velocity_integral += current_wheel_vel * dt; 
             
-            // 1. Integrate the wheel velocity
-            wheel_velocity_integral += current_wheel_vel * 0.005f; // dt = 5ms
-            
-            // Optional: Anti-windup for the integral so it doesn't lean too far
-            if(wheel_velocity_integral > 500.0f) wheel_velocity_integral = 500.0f;
-            if(wheel_velocity_integral < -500.0f) wheel_velocity_integral = -500.0f;
+            if(wheel_velocity_integral > INTEGRAL_CLAMPING) wheel_velocity_integral = INTEGRAL_CLAMPING;
+            if(wheel_velocity_integral < -INTEGRAL_CLAMPING) wheel_velocity_integral = -INTEGRAL_CLAMPING;
 
-            // 2. Calculate the new target angle
-            // If wheel spins positive, tilt positive to catch it.
-            target_angle = (Kp_outer * current_wheel_vel) + (Ki_outer * wheel_velocity_integral);
+            // Calculate PI target, PLUS the manual target pitch from the Web Dashboard slider!
+            target_angle = (Kp_outer * current_wheel_vel) + (Ki_outer * wheel_velocity_integral) + comms.getTargetPitch();
             
-            // Clamp target angle to a safe mechanical limit (e.g., +/- 3 degrees)
-            const float MAX_TILT = 0.052f; // ~3 degrees in radians
-            if (target_angle > MAX_TILT) target_angle = MAX_TILT;
-            if (target_angle < -MAX_TILT) target_angle = -MAX_TILT;
+            if (target_angle > MAX_PITCH_TARGET) target_angle = MAX_PITCH_TARGET;
+            if (target_angle < -MAX_PITCH_TARGET) target_angle = -MAX_PITCH_TARGET;
 
         } else {
-            // Robot fell over. Reset integrals.
             target_angle = 0.0f;
             wheel_velocity_integral = 0.0f;
         }
 
-        comms.sendPacket(userTargetCurrent, currentFaults);
-
-        // ==========================================
-        // INNER LOOP: Standard LQR
-        // ==========================================
+        // --- 5. INNER LOOP (LQR) ---
         if (currentFaults == FAULT_NONE) {
-            if (abs(imu.getPitch()) > 0.35f) {
+            if (abs(imu.getPitch()) > ANGLE_THRESHOLD) {
                 target = 0.0f; 
             } else {
-                // Compute LQR, but calculate Theta ERROR relative to our new target!
                 float theta_error = imu.getPitch() - target_angle;
                 
-                    target = -lqr.compute(
+                target = -lqr.compute(
                     theta_error,            // x1: Angle ERROR
                     imu.getPitchRate(),     // x2: Cube Velocity
                     current_wheel_vel,      // x3: Wheel Velocity
-                    0.005f                  // dt: 5ms
+                    dt                      // dt: Fixed time step
                 );
             }
+        } else {
+            target = 0.0f;
         }
-        // if (currentFaults == FAULT_NONE) {
-        //     if (std::abs(imu.getPitch()) > 0.35f) {
-        //         target = 0.0f; 
-        //         lqr.resetIntegral(); // Add a quick function to zero wheel_integral in LQR.cpp!
-        //     } else {
-        //             target = -lqr.compute(
-        //             imu.getPitch(),         // x1: Raw Angle
-        //             imu.getPitchRate(),     // x2: Cube Velocity
-        //             current_wheel_vel,      // x3: Wheel Velocity
-        //             0.005f                  // dt: 5ms
-        //         );
-        //     }
-        // }
 
-        // 5. Safely send the torque command to Core 0
         shared_target_torque.store(target);
 
-        // 3. Telemetry Monitor
+        // --- 6. SEND TELEMETRY TO WI-FI MCU ---
+        comms.setTelemetryTuning(Kp_outer, Ki_outer, lqr_k1, lqr_k2, lqr_k3);
+        comms.setTelemetryMotors(current_wheel_vel, 0, 0, shared_motor_iq.load(), 0, 0);
+        comms.setTelemetryKinematics(imu.getPitch() * RAD_TO_DEG, imu.getPitchRate() * RAD_TO_DEG, currentFaults);
+        
+        // Include the Mahony raw data stream!
+        comms.setTelemetryIMU(imu.getAccelX(), imu.getAccelY(), imu.getAccelZ(), 
+                              imu.getGyroX(), imu.getGyroY(), imu.getGyroZ());
+        
+        comms.sendTelemetryPacket();
+
+        // --- 7. DEBUG OUTPUT ---
         if (millis() - lastPrintTime >= PRINT_INTERVAL_MS) {
             lastPrintTime = millis();
-            
-            // Plotter format: "Label1:Value1,Label2:Value2"
-            Serial.printf("Angle:%.2f, PitchRate:%.2f, Target:%.2f, WheelVel:%.2f, Iq:%.2f, Battery:%.2fV\n", 
-                          imu.getPitch()*RAD_TO_DEG, 
-                          imu.getPitchRate(), target, current_wheel_vel, shared_motor_iq.load(), battery.readVoltage());
+            Serial.printf("Angle:%.2f, TargetAngle:%.2f, WheelVel:%.2f, Kp:%.4f, Faults:0x%X\n", 
+                          imu.getPitch()*RAD_TO_DEG, target_angle*RAD_TO_DEG, current_wheel_vel, Kp_outer, currentFaults);
         }
-        // if (millis() - lastPrintTime >= PRINT_INTERVAL_MS) {
-        //     lastPrintTime = millis();
-        //     float safe_iq = shared_motor_iq.load();
-        //     Serial.printf("Batt: %05.2fV | Angle: %05.2f deg | Cube Velocity: %05.2f | Wheel Velocity:%05.1f Iq:%05.2f Target:%05.2f\n",
-        //                   battery.readVoltage(), imu.getPitch(), imu.getPitchRate(), motor1.getVelocity(), motor1.getCurrentQ(), target);
-        // }
         
-        // Sleep until exactly 5ms have passed
         vTaskDelayUntil(&xLastWakeTime, xFrequency);
     }
 }
 
 void setup() {
     Serial.begin(115200);
-    delay(2000); // Wait for Serial to initialize
+    comms.begin(1000000); 
+
+    delay(2000); 
     Serial.println("\n\n=======================================");
     Serial.println("       BALANCE BOT BOOTING...          ");  
     Serial.println("=======================================\n");
 
     SimpleFOCDebug::enable(&Serial);
-
     hwSpi.begin(MASTER_SCK, MASTER_MISO, MASTER_MOSI, -1);
     
     motor1.begin(&hwSpi);
     battery.begin();
-
     lqr.setCurrentLimit(MotorTuning.current_limit);
     
     if (!imu.init()) {
         Serial.println("IMU init failed!");
         while (1);
     }
-    
     imu.calibrate();
-
-    command.add('P', onKpOuter, "Outer Loop Kp");
-    command.add('I', onKiOuter, "Outer Loop Ki");
 
     disableCore0WDT();
 
-    // Pin FOC to Core 0 (Priority 5 - Highest)
     xTaskCreatePinnedToCore(taskFOC, "MotorTask", 8192, NULL, 5, NULL, 1);
-    
-    // Pin LQR to Core 1 (Priority 4 - High)
     xTaskCreatePinnedToCore(taskLQR, "LQR_Task", 8192, NULL, 4, NULL, 0);
 }
 

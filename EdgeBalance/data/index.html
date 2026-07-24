@@ -1,120 +1,132 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <title>Cube Telemetry</title>
+  <title>Cube Controller</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <style>
-    /* CSS: Makes it look like a clean mobile app */
-    body { font-family: Arial, sans-serif; background-color: #121212; color: #ffffff; text-align: center; margin: 0; padding: 20px; }
-    .card { background-color: #1e1e1e; border-radius: 10px; padding: 15px; margin-bottom: 20px; box-shadow: 0 4px 8px rgba(0,0,0,0.2); }
-    h2 { margin-top: 0; color: #4CAF50; }
-    .telemetry-data { font-size: 24px; font-weight: bold; color: #03A9F4; }
-    input[type=range] { width: 90%; margin: 15px 0; }
-    button { background-color: #4CAF50; color: white; border: none; padding: 15px 30px; margin: 5px; border-radius: 5px; font-size: 18px; cursor: pointer; }
-    .btn-danger { background-color: #f44336; }
-    #status { font-size: 14px; color: #ffeb3b; }
+    body { font-family: monospace; background: #121212; color: #fff; padding: 10px; margin: 0; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .card { background: #1e1e1e; padding: 15px; border-radius: 8px; }
+    button { padding: 10px; font-weight: bold; background: #4CAF50; color: white; border: none; border-radius: 4px; width: 100%; margin-top: 5px; cursor: pointer; }
+    .btn-danger { background: #f44336; }
+    input[type=range] { width: 100%; }
+    .data-row { display: flex; justify-content: space-between; border-bottom: 1px solid #333; padding: 4px 0; }
+    .val { color: #03A9F4; font-weight: bold; }
   </style>
 </head>
 <body>
+  <h2 style="text-align: center; margin-top:0;">Telemetry <span id="status" style="font-size:12px;color:red;">(Offline)</span></h2>
+  
+  <div class="grid">
+    <div class="card">
+      <div class="data-row"><span>Pitch:</span> <span class="val" id="t_pitch">0.00</span></div>
+      <div class="data-row"><span>Rate:</span> <span class="val" id="t_rate">0.00</span></div>
+      <div class="data-row"><span>Fault:</span> <span class="val" id="t_fault">0</span></div>
+      <hr>
+      <div class="data-row"><span>M1 (RPM|A):</span> <span class="val"><span id="m1v">0</span> | <span id="m1c">0.0</span></span></div>
+      <div class="data-row"><span>M2 (RPM|A):</span> <span class="val"><span id="m2v">0</span> | <span id="m2c">0.0</span></span></div>
+      <div class="data-row"><span>M3 (RPM|A):</span> <span class="val"><span id="m3v">0</span> | <span id="m3c">0.0</span></span></div>
+      <hr>
+      <div style="font-size:10px; color:#aaa;">Mahony IMU Data</div>
+      <div class="data-row"><span>Accel (xyz):</span> <span class="val" id="imu_a">0, 0, 0</span></div>
+      <div class="data-row"><span>Gyro (xyz):</span> <span class="val" id="imu_g">0, 0, 0</span></div>
+    </div>
 
-  <h1>Cube Controller</h1>
-  <p id="status">Connecting to Robot...</p>
-
-  <div class="card">
-    <h2>Telemetry</h2>
-    <p>Pitch Angle: <span id="pitch" class="telemetry-data">0.0</span>&deg;</p>
-    <p>Motor A RPM: <span id="motor_a" class="telemetry-data">0</span></p>
-    <p>Motor B RPM: <span id="motor_b" class="telemetry-data">0</span></p>
+    <div class="card">
+      <button onclick="sendCmd('state', {state: 1, edge: 1})">Enable Edge 1</button>
+      <button onclick="sendCmd('state', {state: 1, edge: 2})">Enable Edge 2</button>
+      <button onclick="sendCmd('state', {state: 1, edge: 3})">Enable Edge 3</button>
+      <button onclick="sendCmd('state', {state: 2, edge: 0})" style="background:#FF9800;">Enable Corner</button>
+      <button onclick="sendCmd('state', {state: 0, edge: 0})" class="btn-danger">DISABLE MOTORS</button>
+    </div>
   </div>
 
-  <div class="card">
-    <h2>Robot State</h2>
-    <button onclick="sendState('enable', 1)">Balance (Edge 1)</button>
-    <button class="btn-danger" onclick="sendState('disable', 0)">Disable Motors</button>
-  </div>
-
-  <div class="card">
-    <h2>LQR Tuning</h2>
+  <div class="card" style="margin-top:10px;">
+    <h3>Tuning</h3>
     
-    <label for="kp_slider">Kp Weight: <span id="kp_val">1.0</span></label><br>
-    <input type="range" id="kp_slider" min="0" max="10" step="0.1" value="1.0" onchange="sendLQR()"><br>
+    <label>Target Pitch: <span id="val_pitch">0.0</span></label>
+    <input type="range" id="sl_pitch" min="-10" max="10" step="0.1" value="0.0" onchange="sendCmd('tune_pitch', {val: this.value})">
 
-    <label for="kd_slider">Kd Weight: <span id="kd_val">0.5</span></label><br>
-    <input type="range" id="kd_slider" min="0" max="5" step="0.05" value="0.5" onchange="sendLQR()"><br>
+    <label>Outer PI - Kp: <span id="val_kp">0.0</span> | Ki: <span id="val_ki">0.0</span></label>
+    <div style="display:flex;"><input type="range" id="sl_kp" min="0" max="10" step="0.1" onchange="tunePI()"><input type="range" id="sl_ki" min="0" max="5" step="0.05" onchange="tunePI()"></div>
+
+    <label>LQR - k1: <span id="val_k1">0.0</span> | k2: <span id="val_k2">0.0</span> | k3: <span id="val_k3">0.0</span></label>
+    <div style="display:flex;">
+      <input type="range" id="sl_k1" min="0" max="5" step="0.1" onchange="tuneLQR()">
+      <input type="range" id="sl_k2" min="0" max="5" step="0.1" onchange="tuneLQR()">
+      <input type="range" id="sl_k3" min="0" max="5" step="0.1" onchange="tuneLQR()">
+    </div>
   </div>
 
   <script>
-    /* JavaScript: The Brains behind the WebSockets */
+    var ws = new WebSocket(`ws://${window.location.hostname}/ws`);
+
+    let isSynced = false;
+
+    ws.onopen = () => { 
+        document.getElementById('status').innerText = "(Live)"; 
+        document.getElementById('status').style.color = "#4CAF50"; 
+    };
+
+    ws.onclose = () => { 
+        document.getElementById('status').innerText = "(Offline)"; 
+        document.getElementById('status').style.color = "red"; 
+        isSynced = false; // Reset sync flag on disconnect
+        setTimeout(() => location.reload(), 2000); 
+    };
     
-    // Automatically connect to the IP address hosting this page
-    var gateway = `ws://${window.location.hostname}/ws`;
-    var websocket;
+    ws.onmessage = (event) => {
+      var d = JSON.parse(event.data);
 
-    // Run this when the page loads
-    window.addEventListener('load', initWebSocket);
+      if (!isSynced && d.sync_kp !== undefined) {
+          // Snap PI sliders and text
+          document.getElementById('sl_kp').value = d.sync_kp;
+          document.getElementById('val_kp').innerText = d.sync_kp.toFixed(4);
+          document.getElementById('sl_ki').value = d.sync_ki;
+          document.getElementById('val_ki').innerText = d.sync_ki.toFixed(4);
 
-    function initWebSocket() {
-      console.log('Trying to open a WebSocket connection...');
-      websocket = new WebSocket(gateway);
-      websocket.onopen    = onOpen;
-      websocket.onclose   = onClose;
-      websocket.onmessage = onMessage; // Handles incoming telemetry
-    }
-
-    function onOpen(event) {
-      document.getElementById('status').innerText = "🟢 Connected";
-      document.getElementById('status').style.color = "#4CAF50";
-    }
-
-    function onClose(event) {
-      document.getElementById('status').innerText = "🔴 Disconnected - Reconnecting...";
-      document.getElementById('status').style.color = "#f44336";
-      setTimeout(initWebSocket, 2000); // Try to reconnect every 2 seconds
-    }
-
-    // Handle Incoming Telemetry (Robot -> Phone)
-    function onMessage(event) {
-      // Parse the JSON string from the ESP32
-      var data = JSON.parse(event.data);
-      
-      // Update the HTML text elements
-      if (data.angle_x !== undefined) {
-        document.getElementById('pitch').innerText = data.angle_x.toFixed(2);
+          // Snap LQR sliders and text
+          document.getElementById('sl_k1').value = d.sync_k1;
+          document.getElementById('val_k1').innerText = d.sync_k1.toFixed(2);
+          document.getElementById('sl_k2').value = d.sync_k2;
+          document.getElementById('val_k2').innerText = d.sync_k2.toFixed(2);
+          document.getElementById('sl_k3').value = d.sync_k3;
+          document.getElementById('val_k3').innerText = d.sync_k3.toFixed(2);
+          
+          isSynced = true; // Never run this block again until reconnected
+          console.log("Dashboard Auto-Synced with Master MCU!");
       }
-      if (data.motor_speeds !== undefined) {
-        document.getElementById('motor_a').innerText = data.motor_speeds[0];
-        document.getElementById('motor_b').innerText = data.motor_speeds[1];
+
+      if(d.p !== undefined) {
+        document.getElementById('t_pitch').innerText = d.p.toFixed(2);
+        document.getElementById('t_rate').innerText = d.pr.toFixed(2);
+        document.getElementById('t_fault').innerText = d.f;
+        
+        document.getElementById('m1v').innerText = d.mv[0].toFixed(0); document.getElementById('m1c').innerText = d.mc[0].toFixed(2);
+        document.getElementById('m2v').innerText = d.mv[1].toFixed(0); document.getElementById('m2c').innerText = d.mc[1].toFixed(2);
+        document.getElementById('m3v').innerText = d.mv[2].toFixed(0); document.getElementById('m3c').innerText = d.mc[2].toFixed(2);
+        
+        document.getElementById('imu_a').innerText = `${d.a[0].toFixed(2)}, ${d.a[1].toFixed(2)}, ${d.a[2].toFixed(2)}`;
+        document.getElementById('imu_g').innerText = `${d.g[0].toFixed(2)}, ${d.g[1].toFixed(2)}, ${d.g[2].toFixed(2)}`;
       }
+    };
+
+    function sendCmd(cmd, payload) {
+      if(cmd === 'tune_pitch') document.getElementById('val_pitch').innerText = payload.val;
+      payload.cmd = cmd;
+      ws.send(JSON.stringify(payload));
     }
 
-    // Send State Commands (Phone -> Robot)
-    function sendState(actionType, edgeTarget) {
-      var payload = {
-        "command": "set_state",
-        "action": actionType,
-        "target_edge": edgeTarget
-      };
-      websocket.send(JSON.stringify(payload));
+    function tunePI() {
+      let kp = document.getElementById('sl_kp').value; let ki = document.getElementById('sl_ki').value;
+      document.getElementById('val_kp').innerText = kp; document.getElementById('val_ki').innerText = ki;
+      ws.send(JSON.stringify({cmd: "tune_pi", kp: kp, ki: ki}));
     }
 
-    // Send LQR Tuning Data (Phone -> Robot)
-    function sendLQR() {
-      // Get current slider values
-      var kp = parseFloat(document.getElementById('kp_slider').value);
-      var kd = parseFloat(document.getElementById('kd_slider').value);
-      
-      // Update the text labels next to the sliders
-      document.getElementById('kp_val').innerText = kp;
-      document.getElementById('kd_val').innerText = kd;
-
-      // Pack into JSON and send
-      var payload = {
-        "command": "set_weights",
-        "controller": "LQR",
-        "weights": [kp, kd, 0.0, 0.0] // Expand this array as you add more sliders
-      };
-      
-      websocket.send(JSON.stringify(payload));
+    function tuneLQR() {
+      let k1 = document.getElementById('sl_k1').value; let k2 = document.getElementById('sl_k2').value; let k3 = document.getElementById('sl_k3').value;
+      document.getElementById('val_k1').innerText = k1; document.getElementById('val_k2').innerText = k2; document.getElementById('val_k3').innerText = k3;
+      ws.send(JSON.stringify({cmd: "tune_lqr", k1: k1, k2: k2, k3: k3}));
     }
   </script>
 </body>

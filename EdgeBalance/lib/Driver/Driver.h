@@ -1,10 +1,10 @@
 #pragma once
 
 #include <Arduino.h>
-#include <SimpleFOC.h>
-#include <SPI.h>
-#include <atomic>
-#include "Config.h" // Your global structs
+#include <SimpleFOC.h> // FOC library
+#include <SPI.h> // communication with encoder
+#include <atomic> // thread safe feature where an operation is executed without interuption (avoiding race conditions)
+#include "Config.h" // configuration import
 
 class Driver {
 public:
@@ -18,7 +18,7 @@ public:
     void emergencyStop();
     void enable();
     
-    // Fault Methods (Added missing declarations!)
+    // Fault Methods
     bool hasHardwareFault(); 
     void printDetailedFaults(const char* motorName);
     

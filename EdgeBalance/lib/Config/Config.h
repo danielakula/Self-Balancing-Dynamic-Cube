@@ -1,6 +1,10 @@
+// ================================================================
+// CONFIGURATION FILE - /w CUSTOMISABLE PARAMETERS
+// ================================================================
+
 #pragma once
 #include <Arduino.h>
-#include <SimpleFOC.h> // REQUIRED for the _NC (Not Connected) macro!
+#include <SimpleFOC.h> // REQUIRED for the _NC (Not Connected) macro
 
 // ================================================================
 // FAULT REGISTERS (32-Bit Bitmask)
@@ -22,8 +26,8 @@ enum SystemFault : uint32_t {
 // ================================================================
 // CONSTRAINTS & SYSTEM CONSTANTS
 // ================================================================
-constexpr float ANGLE_THRESHOLD = 0.35f;
-constexpr float MAX_PITCH_TARGET = 0.052f; 
+constexpr float ANGLE_THRESHOLD = 20.0f * (PI / 180.0f); // activation angle
+constexpr float MAX_PITCH_TARGET = 3.0f * (PI / 180.0f); // max target angle deviation
 constexpr float INTEGRAL_CLAMPING = 500.0f; // MAX INTEGRAL = MAX TARGET ANGLE / Ki
 constexpr float TASK_LOOP_FREQUENCY = 5.0f; // ms
 constexpr uint32_t PRINT_INTERVAL_MS = 200; 
@@ -39,28 +43,6 @@ constexpr float DEFAULT_LQR_K3 = -0.0817f;   // Wheel Velocity
 // OUTER LOOP PI Gains
 constexpr float DEFAULT_KP_OUTER = 0.003f; 
 constexpr float DEFAULT_KI_OUTER = 0.0001f;
-
-// ================================================================
-//  MOTOR TUNING
-// ================================================================
-struct MotorConfig {
-    float R, L;
-    float bandwidth_hz;
-    float driver_frequency;
-    float voltage_limit;
-    float current_limit;
-    float friction_comp;
-};
-
-inline constexpr MotorConfig MotorTuning = {
-    0.537f,     // R (Resistance) 
-    0.00018f,   // L (Inductance)
-    150.0f,     // Bandwidth (Hz)
-    15000.0f,   // Driver frequency (Hz)
-    14.0f,      // Voltage limit (Volts)
-    3.0f,       // Current limit (Amps)
-    0.0f        // Static friction compensation (Amps) roughly 0.15A
-};
 
 // ================================================================
 // WIFI & OTA
@@ -133,4 +115,26 @@ inline constexpr MotorPins Motor3Pins = {
     41, 10, 20, 19,             // ENC_CS, DRV_CS, EN, Fault
     8, 18, 17, 16, 15, 7,       // PWM (AH..CL)
     11, 9, 3                    // Current Sense (SoA, SoB, SoC)
+};
+
+// ================================================================
+//  MOTOR TUNING
+// ================================================================
+struct MotorConfig {
+    float R, L;
+    float bandwidth_hz;
+    float driver_frequency;
+    float voltage_limit;
+    float current_limit;
+    float friction_comp;
+};
+
+inline constexpr MotorConfig MotorTuning = {
+    0.537f,     // R (Resistance) 
+    0.00018f,   // L (Inductance)
+    150.0f,     // Bandwidth (Hz)
+    15000.0f,   // Driver frequency (Hz)
+    14.0f,      // Voltage limit (Volts)
+    3.0f,       // Current limit (Amps)
+    0.0f        // Static friction compensation (Amps) roughly 0.15A - work well at 0.0A
 };

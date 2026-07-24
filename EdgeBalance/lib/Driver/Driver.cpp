@@ -131,7 +131,7 @@ float Driver::getVelocity() { return _motor.shaft_velocity; }
 float Driver::getCurrentQ() { return _motor.current.q; }
 
 // --------------------------------------------------------
-// LOW-LEVEL SPI (Optimized for Speed)
+// LOW-LEVEL SPI 
 // --------------------------------------------------------
 void Driver::drvWriteSpi(uint8_t address, uint16_t data) {
     digitalWrite(_pins.enc_cs, HIGH); 
